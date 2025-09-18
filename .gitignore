@@ -47,3 +47,14 @@ service-account-key.json
 # Logs
 *.log
 logs/
+
+# uv
+.python-version
+
+# Database and cache
+codebase_db/
+.embedding_cache/
+temp_uploads/
+
+# Local data
+test_repo/
