@@ -10,12 +10,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..models import Codebase, CodeChunk, IndexingHistory
-from ..supabase_database import supabase_db_manager as db_manager
+from database import SessionLocal, engine
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass 
+@dataclass
 class VectorRecord:
     """Record in the vector database - keeping same interface as LanceDB version."""
     id: str
@@ -28,7 +28,8 @@ class VectorRecord:
     line_start: int
     line_end: int
     parent_name: Optional[str] = None
-    docstring: Optional[str] = None
+    description: Optional[str] = None
+    description_embedding: Optional[List[float]] = None
     metadata: Optional[Dict[str, Any]] = None
 
 
@@ -38,14 +39,10 @@ class PostgreSQLVectorStore:
     def __init__(self, database_url: str = None):
         """
         Initialize PostgreSQL vector store.
-        
+
         Args:
-            database_url: PostgreSQL connection URL
+            database_url: PostgreSQL connection URL (ignored - uses DATABASE_URL from env)
         """
-        if database_url:
-            db_manager.database_url = database_url
-        
-        self.db = db_manager
         self._initialized = False
         logger.info("PostgreSQL vector store initialized")
     
@@ -53,26 +50,29 @@ class PostgreSQLVectorStore:
         """Initialize database and create tables if needed."""
         if self._initialized:
             return
-            
+
         try:
-            # Create database if it doesn't exist
-            self.db.create_database_if_not_exists()
-            
-            # Initialize connection
-            self.db.initialize()
-            
+            from database import Base, test_connection
+            from sqlalchemy import text
+
+            # Test connection
+            if not test_connection():
+                raise Exception("Database connection failed")
+
             # Setup pgvector extension
-            self.db.setup_pgvector()
-            
+            with engine.connect() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+
             # Create tables
-            self.db.create_tables()
-            
+            Base.metadata.create_all(bind=engine)
+
             # Create indexes for better performance
             self._create_indexes()
-            
+
             self._initialized = True
             logger.info("PostgreSQL vector store setup completed")
-            
+
         except Exception as e:
             logger.error(f"Error initializing PostgreSQL vector store: {e}")
             raise
@@ -80,7 +80,8 @@ class PostgreSQLVectorStore:
     def _create_indexes(self):
         """Create additional indexes for performance."""
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 # Check if we have enough data for IVFFlat index
                 row_count = session.execute(text("SELECT COUNT(*) FROM code_chunks")).scalar()
                 
@@ -94,10 +95,11 @@ class PostgreSQLVectorStore:
                     WITH (lists = {lists})
                     """
                     session.execute(text(index_sql))
+                    session.commit()
                     logger.info(f"Created IVFFlat index with {lists} lists for {row_count} rows")
                 else:
                     logger.info(f"Skipping IVFFlat index creation - only {row_count} rows (need at least 1000)")
-                
+
                 # Additional indexes for common queries
                 indexes = [
                     "CREATE INDEX IF NOT EXISTS idx_code_chunks_language ON code_chunks(language)",
@@ -105,12 +107,14 @@ class PostgreSQLVectorStore:
                     "CREATE INDEX IF NOT EXISTS idx_code_chunks_name ON code_chunks(name)",
                     "CREATE INDEX IF NOT EXISTS idx_code_chunks_parent_name ON code_chunks(parent_name)",
                 ]
-                
+
                 for index_sql in indexes:
                     session.execute(text(index_sql))
-                
+
                 session.commit()
                 logger.info("Created vector and query indexes")
+            finally:
+                session.close()
                 
         except Exception as e:
             logger.warning(f"Error creating indexes: {e}")
@@ -129,24 +133,27 @@ class PostgreSQLVectorStore:
             self.initialize()
         
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 # Check if codebase already exists
                 existing = session.query(Codebase).filter(Codebase.name == codebase_name).first()
-                
+
                 if existing:
                     # Delete existing codebase and all chunks
                     logger.info(f"Deleting existing codebase: {codebase_name}")
                     session.delete(existing)
                     session.commit()
-                
+
                 # Create new codebase entry
                 codebase = Codebase(name=codebase_name)
                 session.add(codebase)
                 session.commit()
-                
+
                 logger.info(f"Created codebase: {codebase_name}")
                 return f"codebase_{codebase_name}"
-                
+            finally:
+                session.close()
+
         except Exception as e:
             logger.error(f"Error creating codebase {codebase_name}: {e}")
             raise
@@ -173,7 +180,8 @@ class PostgreSQLVectorStore:
         total_inserted = 0
         
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 # Get codebase
                 codebase = session.query(Codebase).filter(Codebase.name == codebase_name).first()
                 if not codebase:
@@ -201,7 +209,8 @@ class PostgreSQLVectorStore:
                                 line_start=record.line_start,
                                 line_end=record.line_end,
                                 parent_name=record.parent_name,
-                                docstring=record.docstring,
+                                description=record.description,
+                                description_embedding=record.description_embedding,
                                 meta_info=record.metadata
                             )
                             chunks.append(chunk)
@@ -231,7 +240,8 @@ class PostgreSQLVectorStore:
                                     line_start=record.line_start,
                                     line_end=record.line_end,
                                     parent_name=record.parent_name,
-                                    docstring=record.docstring,
+                                    description=record.description,
+                                    description_embedding=record.description_embedding,
                                     meta_info=record.metadata
                                 )
                                 session.add(chunk)
@@ -244,42 +254,44 @@ class PostgreSQLVectorStore:
                                 continue
                 
                 logger.info(f"Inserted {total_inserted}/{len(records)} records into {codebase_name}")
-                
+
                 # Update indexes after bulk insert if we have enough data
                 if total_inserted >= 1000:
                     logger.info("Updating vector indexes after bulk insert...")
                     self._create_indexes()
-                
+
                 return total_inserted > 0
-                
+            finally:
+                session.close()
+
         except Exception as e:
             logger.error(f"Error inserting records: {e}")
             return False
     
     def search(
-        self, 
-        codebase_name: str, 
-        query_vector: List[float], 
+        self,
+        codebase_name: str,
+        query_vector: List[float],
         top_k: int = 5,
         filters: Dict[str, Any] = None
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors in a codebase.
-        
+
         Args:
             codebase_name: Name of the codebase
             query_vector: Query vector
             top_k: Number of results to return
             filters: Optional filters to apply
-            
+
         Returns:
             List of search results
         """
-        if not self._initialized:
-            self.initialize()
+        # Note: No initialization needed for search - tables should already exist
         
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 # Get codebase
                 codebase = session.query(Codebase).filter(Codebase.name == codebase_name).first()
                 if not codebase:
@@ -318,17 +330,96 @@ class PostgreSQLVectorStore:
                         'line_start': chunk.line_start,
                         'line_end': chunk.line_end,
                         'parent_name': chunk.parent_name,
-                        'docstring': chunk.docstring,
+                        'description': chunk.description,
                         'score': float(distance)  # Cosine distance
                     }
                     search_results.append(result)
-                
+
                 return search_results
-                
+            finally:
+                session.close()
+
         except Exception as e:
             logger.error(f"Error searching in {codebase_name}: {e}")
             return []
-    
+
+    def search_by_description(
+        self,
+        codebase_name: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        filters: Dict[str, Any] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for similar vectors using description embeddings.
+
+        Args:
+            codebase_name: Name of the codebase
+            query_vector: Query vector (natural language embedding)
+            top_k: Number of results to return
+            filters: Optional filters to apply
+
+        Returns:
+            List of search results
+        """
+        try:
+            session = SessionLocal()
+            try:
+                # Get codebase
+                codebase = session.query(Codebase).filter(Codebase.name == codebase_name).first()
+                if not codebase:
+                    logger.warning(f"Codebase {codebase_name} not found")
+                    return []
+
+                # Build query - only search chunks with description_embedding
+                query = session.query(CodeChunk).filter(
+                    CodeChunk.codebase_id == codebase.id,
+                    CodeChunk.description_embedding.isnot(None)
+                )
+
+                # Apply filters
+                if filters:
+                    if 'chunk_type' in filters:
+                        query = query.filter(CodeChunk.chunk_type == filters['chunk_type'])
+                    if 'language' in filters:
+                        query = query.filter(CodeChunk.language == filters['language'])
+                    if 'parent_name' in filters:
+                        query = query.filter(CodeChunk.parent_name == filters['parent_name'])
+
+                # Add vector similarity search with distance
+                query = query.add_columns(
+                    CodeChunk.description_embedding.cosine_distance(query_vector).label('distance')
+                ).order_by(CodeChunk.description_embedding.cosine_distance(query_vector)).limit(top_k)
+
+                results = query.all()
+
+                # Convert to result format
+                search_results = []
+                for chunk, distance in results:
+                    result = {
+                        'id': str(chunk.id),
+                        'text': chunk.text,
+                        'chunk_type': chunk.chunk_type,
+                        'name': chunk.name,
+                        'file_path': chunk.file_path,
+                        'language': chunk.language,
+                        'line_start': chunk.line_start,
+                        'line_end': chunk.line_end,
+                        'parent_name': chunk.parent_name,
+                        'description': chunk.description,
+                        'score': float(distance)  # Cosine distance
+                    }
+                    search_results.append(result)
+
+                logger.info(f"Description search found {len(search_results)} results in {codebase_name}")
+                return search_results
+            finally:
+                session.close()
+
+        except Exception as e:
+            logger.error(f"Error in description search for {codebase_name}: {e}")
+            return []
+
     def list_codebases(self) -> List[Dict[str, Any]]:
         """
         List all indexed codebases.
@@ -340,7 +431,8 @@ class PostgreSQLVectorStore:
             self.initialize()
         
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 # Get codebases with statistics
                 codebases = session.query(Codebase).all()
                 
@@ -373,9 +465,11 @@ class PostgreSQLVectorStore:
                         'chunk_types': chunk_types
                     }
                     results.append(codebase_info)
-                
+
                 return results
-                
+            finally:
+                session.close()
+
         except Exception as e:
             logger.error(f"Error listing codebases: {e}")
             return []
@@ -394,7 +488,8 @@ class PostgreSQLVectorStore:
             self.initialize()
         
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 codebase = session.query(Codebase).filter(Codebase.name == codebase_name).first()
                 if codebase:
                     session.delete(codebase)  # Cascading delete will remove chunks
@@ -404,7 +499,9 @@ class PostgreSQLVectorStore:
                 else:
                     logger.warning(f"Codebase {codebase_name} not found")
                     return False
-                    
+            finally:
+                session.close()
+
         except Exception as e:
             logger.error(f"Error deleting codebase {codebase_name}: {e}")
             return False
@@ -423,7 +520,8 @@ class PostgreSQLVectorStore:
             self.initialize()
         
         try:
-            with self.db.get_session() as session:
+            session = SessionLocal()
+            try:
                 codebase = session.query(Codebase).filter(Codebase.name == codebase_name).first()
                 if not codebase:
                     return {}
@@ -473,9 +571,11 @@ class PostgreSQLVectorStore:
                     'avg_chunk_size': float(stats_result.avg_chunk_size) if stats_result.avg_chunk_size else 0,
                     'largest_file': largest_file_query[0] if largest_file_query else None
                 }
-                
+
                 return stats
-                
+            finally:
+                session.close()
+
         except Exception as e:
             logger.error(f"Error getting stats for {codebase_name}: {e}")
             return {}

@@ -9,6 +9,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Optional: AI docstring generator (lazily imported)
+_docstring_generator = None
+
 
 @dataclass
 class CodeChunk:
@@ -21,16 +24,25 @@ class CodeChunk:
     line_start: int
     line_end: int
     parent_name: Optional[str] = None
-    docstring: Optional[str] = None
+    description: Optional[str] = None
 
 
 class CodeParser:
     """Tree-sitter based code parser for multiple languages."""
-    
-    def __init__(self):
-        """Initialize the code parser with supported languages."""
+
+    def __init__(self, ai_docstring_enabled: bool = True, ai_model: str = "gemini"):
+        """
+        Initialize the code parser with supported languages.
+
+        Args:
+            ai_docstring_enabled: Whether to generate docstrings using AI when not present
+            ai_model: AI model to use for docstring generation ("gemini" or "openai")
+        """
         self.parsers = {}
         self.languages = {}
+        self.ai_docstring_enabled = ai_docstring_enabled
+        self.ai_model = ai_model
+        self._docstring_generator = None
         self._setup_languages()
     
     def _setup_languages(self):
@@ -113,57 +125,243 @@ class CodeParser:
         return chunks
     
     def _get_node_text(self, node, source_code: str) -> str:
-        """Extract text from a tree-sitter node."""
-        return source_code[node.start_byte:node.end_byte]
+        """
+        Extract text from a tree-sitter node.
+
+        Args:
+            node: Tree-sitter node with byte offsets
+            source_code: Source code as string
+
+        Returns:
+            Extracted text from the node
+
+        Note:
+            Tree-sitter uses byte offsets, but Python strings use character indices.
+            We need to convert to bytes, slice, then decode back to handle multi-byte
+            UTF-8 characters correctly.
+        """
+        # Convert to bytes, extract using byte offsets, then decode back
+        source_bytes = source_code.encode('utf-8')
+        node_bytes = source_bytes[node.start_byte:node.end_byte]
+        return node_bytes.decode('utf-8')
+
+    def _extract_docstring(self, docstring_text: str) -> str:
+        """
+        Extract docstring content by removing quotes.
+
+        Args:
+            docstring_text: Raw docstring text with quotes
+
+        Returns:
+            Cleaned docstring without quotes
+        """
+        if not docstring_text:
+            return ""
+
+        text = docstring_text.strip()
+
+        # Try to remove quotes in order of specificity
+        for quote in ['"""', "'''", '"', "'"]:
+            if text.startswith(quote) and text.endswith(quote) and len(text) >= 2 * len(quote):
+                return text[len(quote):-len(quote)].strip()
+
+        # If no quotes found, return as-is
+        return text
+
+    def _get_or_generate_description(
+        self,
+        node,
+        content: str,
+        chunk_type: str,
+        name: str,
+        language: str = "python"
+    ) -> Optional[str]:
+        """
+        Extract description from node or generate using AI if not present.
+
+        Args:
+            node: Tree-sitter node
+            content: Source code content
+            chunk_type: Type of code chunk ('function', 'class', etc.)
+            name: Name of the function/class
+            language: Programming language
+
+        Returns:
+            Description text or None
+        """
+        # First, try to extract description from the code
+        description = None
+
+        if len(node.children) > 0:
+            body = node.children[-1]  # function/class body
+            if body.type == 'block':
+                for stmt in body.children:
+                    if stmt.type == 'expression_statement':
+                        expr = stmt.children[0] if stmt.children else None
+                        if expr and expr.type == 'string':
+                            description_raw = self._get_node_text(expr, content)
+                            description = self._extract_docstring(description_raw)
+                            break
+
+        # If description exists, return it
+        if description:
+            return description
+
+        # If no description and AI is enabled, generate one
+        if self.ai_docstring_enabled:
+            return self._generate_ai_description(node, content, chunk_type, name, language)
+
+        return None
+
+    def _generate_ai_description(
+        self,
+        node,
+        content: str,
+        chunk_type: str,
+        name: str,
+        language: str
+    ) -> Optional[str]:
+        """
+        Generate description using AI.
+
+        Args:
+            node: Tree-sitter node
+            content: Source code content
+            chunk_type: Type of code chunk
+            name: Name of the function/class
+            language: Programming language
+
+        Returns:
+            Generated description or None
+        """
+        # Lazy import and initialization
+        if self._docstring_generator is None:
+            try:
+                from .docstring_generator import DocstringGenerator
+                self._docstring_generator = DocstringGenerator(model=self.ai_model)
+                logger.info("Initialized AI docstring generator")
+            except Exception as e:
+                logger.warning(f"Failed to initialize AI docstring generator: {e}")
+                # Disable AI generation if initialization fails
+                self.ai_docstring_enabled = False
+                return None
+
+        # Generate description
+        try:
+            code = self._get_node_text(node, content)
+            description = self._docstring_generator.generate_docstring(
+                code=code,
+                chunk_type=chunk_type,
+                name=name,
+                language=language
+            )
+            return description
+        except Exception as e:
+            logger.warning(f"Error generating AI description for {name}: {e}")
+            return None
     
     def _parse_python(self, root_node, content: str, file_path: str) -> List[CodeChunk]:
         """Parse Python code using tree-sitter."""
         chunks = []
-        
+
         def traverse_node(node, parent_name: str = None):
+            # Handle decorated definitions (functions/classes with decorators)
+            if node.type == 'decorated_definition':
+                # Find the actual function or class definition inside
+                for child in node.children:
+                    if child.type in ['function_definition', 'class_definition']:
+                        # Process the inner definition but use the decorated_definition node
+                        # for extracting content (to include decorators)
+                        if child.type == 'function_definition':
+                            func_name = None
+                            # Find function name
+                            for subchild in child.children:
+                                if subchild.type == 'identifier':
+                                    func_name = self._get_node_text(subchild, content)
+                                    break
+
+                            # Determine chunk type (function or method)
+                            chunk_type = 'method' if parent_name else 'function'
+
+                            # Extract or generate description from the function definition
+                            description = self._get_or_generate_description(
+                                node=child,
+                                content=content,
+                                chunk_type=chunk_type,
+                                name=func_name or 'unknown_function',
+                                language='python'
+                            )
+
+                            # Use decorated_definition node for content to include decorators
+                            chunk = CodeChunk(
+                                content=self._get_node_text(node, content),
+                                language='python',
+                                chunk_type=chunk_type,
+                                name=func_name or 'unknown_function',
+                                file_path=file_path,
+                                line_start=node.start_point[0] + 1,
+                                line_end=node.end_point[0] + 1,
+                                parent_name=parent_name,
+                                description=description
+                            )
+                            chunks.append(chunk)
+                        elif child.type == 'class_definition':
+                            # Handle decorated class similarly
+                            traverse_node(child, parent_name)
+                return  # Don't traverse children again
+
             if node.type == 'function_definition':
                 func_name = None
-                docstring = None
-                
+
                 # Find function name
                 for child in node.children:
                     if child.type == 'identifier':
                         func_name = self._get_node_text(child, content)
                         break
-                
-                # Find docstring
-                if len(node.children) > 0:
-                    body = node.children[-1]  # function body
-                    if body.type == 'block':
-                        for stmt in body.children:
-                            if stmt.type == 'expression_statement':
-                                expr = stmt.children[0] if stmt.children else None
-                                if expr and expr.type == 'string':
-                                    docstring = self._get_node_text(expr, content).strip('"\'')
-                                    break
-                
+
+                # Determine chunk type (function or method)
+                chunk_type = 'method' if parent_name else 'function'
+
+                # Extract or generate description
+                description = self._get_or_generate_description(
+                    node=node,
+                    content=content,
+                    chunk_type=chunk_type,
+                    name=func_name or 'unknown_function',
+                    language='python'
+                )
+
                 chunk = CodeChunk(
                     content=self._get_node_text(node, content),
                     language='python',
-                    chunk_type='function',
+                    chunk_type=chunk_type,
                     name=func_name or 'unknown_function',
                     file_path=file_path,
                     line_start=node.start_point[0] + 1,
                     line_end=node.end_point[0] + 1,
                     parent_name=parent_name,
-                    docstring=docstring
+                    description=description
                 )
                 chunks.append(chunk)
-            
+
             elif node.type == 'class_definition':
                 class_name = None
-                
+
                 # Find class name
                 for child in node.children:
                     if child.type == 'identifier':
                         class_name = self._get_node_text(child, content)
                         break
-                
+
+                # Extract or generate description for class
+                description = self._get_or_generate_description(
+                    node=node,
+                    content=content,
+                    chunk_type='class',
+                    name=class_name or 'unknown_class',
+                    language='python'
+                )
+
                 chunk = CodeChunk(
                     content=self._get_node_text(node, content),
                     language='python',
@@ -172,19 +370,20 @@ class CodeParser:
                     file_path=file_path,
                     line_start=node.start_point[0] + 1,
                     line_end=node.end_point[0] + 1,
-                    parent_name=parent_name
+                    parent_name=parent_name,
+                    description=description
                 )
                 chunks.append(chunk)
-                
+
                 # Parse methods inside class
                 for child in node.children:
                     traverse_node(child, class_name)
                 return  # Don't traverse children again
-            
+
             # Traverse children
             for child in node.children:
                 traverse_node(child, parent_name)
-        
+
         traverse_node(root_node)
         return chunks
     

@@ -1,0 +1,4 @@
+{
+  "docstring": "Extracts code chunks (functions, classes) from a node and recursively traverses its children.",
+  "generated_at": "1760243820.181654"
+}

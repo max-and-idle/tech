@@ -190,30 +190,35 @@ async def index_local_directory(request: LocalIndexRequest):
     "/search",
     response_model=SearchResponse,
     summary="Search Codebase",
-    description="Perform semantic search on an indexed codebase"
+    description="Perform semantic search on an indexed codebase with optional HyDE and reranking"
 )
 async def search_codebase(request: SearchRequest):
     """Search an indexed codebase."""
     try:
-        logger.info(f"Search request: '{request.query}' in {request.codebase_name}")
-        
+        logger.info(
+            f"Search request: '{request.query}' in {request.codebase_name} "
+            f"(type={request.search_type}, hyde={request.use_hyde}, rerank={request.use_reranking})"
+        )
+
         result = indexer.search(
             query=request.query,
             codebase_name=request.codebase_name,
             top_k=request.top_k,
             search_type=request.search_type,
             filters=request.filters,
-            include_context=request.include_context
+            include_context=request.include_context,
+            use_hyde=request.use_hyde,
+            use_reranking=request.use_reranking
         )
-        
+
         if 'error' in result:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=result['error']
             )
-        
+
         return SearchResponse(**result)
-        
+
     except HTTPException:
         raise
     except Exception as e:

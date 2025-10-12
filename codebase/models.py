@@ -56,7 +56,8 @@ class CodeChunk(Base):
     line_start = Column(Integer)
     line_end = Column(Integer)
     parent_name = Column(String(255))
-    docstring = Column(Text)
+    description = Column(Text)
+    description_embedding = Column(Vector())
     
     # Additional metadata as JSON
     meta_info = Column(JSON)
@@ -82,7 +83,7 @@ class CodeChunk(Base):
             'line_start': self.line_start,
             'line_end': self.line_end,
             'parent_name': self.parent_name,
-            'docstring': self.docstring,
+            'description': self.description,
             'metadata': self.meta_info or {},
             'created_at': self.created_at.isoformat() if self.created_at else None
         }

@@ -88,62 +88,66 @@ class EmbeddingGenerator:
             logger.error(f"Failed to initialize OpenAI: {e}")
             self.client = None
     
-    def generate_embedding(self, text: str, metadata: Dict[str, Any] = None) -> Optional[EmbeddingResult]:
+    def generate_embedding(self, text: str, metadata: Dict[str, Any] = None, for_query: bool = False) -> Optional[EmbeddingResult]:
         """
         Generate embedding for a single text.
-        
+
         Args:
             text: Text to embed
             metadata: Additional metadata
-            
+            for_query: If True, optimize for query (uses retrieval_query task type for Gemini)
+
         Returns:
             EmbeddingResult or None if failed
         """
         if not text.strip():
             return None
-        
+
         # Check if client is available
         if self.client is None:
             logger.warning("No embedding client available. Please configure API keys.")
             return None
-        
-        # Generate hash for caching
-        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-        
+
+        # Generate hash for caching (include query flag in hash)
+        cache_key = f"{text}_{for_query}"
+        text_hash = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
+
         # Check cache first
         cached_result = self._load_from_cache(text_hash)
         if cached_result:
             return cached_result
-        
+
         try:
             if self.model == "gemini":
-                embedding = self._generate_gemini_embedding(text)
+                # Use different task_type for queries vs documents
+                task_type = "retrieval_query" if for_query else "retrieval_document"
+                embedding = self._generate_gemini_embedding(text, task_type=task_type)
             elif self.model == "openai":
                 embedding = self._generate_openai_embedding(text)
             else:
                 logger.error(f"Unknown model: {self.model}")
                 return None
-            
+
             if not embedding:
                 return None
-            
+
             # Auto-detect dimensions from first embedding
             if self.dimensions is None:
                 self.dimensions = len(embedding)
                 logger.info(f"Auto-detected embedding dimensions: {self.dimensions}")
-            
+
             result = EmbeddingResult(
                 text=text,
                 embedding=embedding,
                 metadata=metadata or {},
                 hash=text_hash
             )
-            
+
             # Cache the result
             self._save_to_cache(result)
-            
+
             return result
-            
+
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
             return None
@@ -186,14 +190,14 @@ class EmbeddingGenerator:
         
         return results
     
-    def _generate_gemini_embedding(self, text: str) -> Optional[List[float]]:
+    def _generate_gemini_embedding(self, text: str, task_type: str = "retrieval_document") -> Optional[List[float]]:
         """Generate embedding using Gemini."""
         try:
             # Use embed_content method
             result = self.client.embed_content(
                 model="models/text-embedding-004",  # Latest embedding model
                 content=text,
-                task_type="retrieval_document"
+                task_type=task_type
             )
             return result['embedding']
         except Exception as e:

@@ -1,0 +1,4 @@
+{
+  "docstring": "Extracts code chunks (functions, classes) and their metadata from a syntax tree node.",
+  "generated_at": "1760243820.181654"
+}

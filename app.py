@@ -30,65 +30,60 @@ logger = logging.getLogger(__name__)
 
 
 async def initialize_database():
-    """Initialize and test Supabase database connection."""
-    logger.info("🔄 Initializing Supabase database connection...")
-    
+    """Initialize and test database connection."""
+    logger.info("🔄 Initializing database connection...")
+
     try:
-        from codebase.supabase_database import supabase_db_manager
-        
-        # Initialize Supabase client
-        supabase_db_manager.initialize()
-        
+        from database import test_connection, engine
+        from sqlalchemy import text
+
         # Test basic connection
         logger.info("🔌 Testing database connection...")
-        if not supabase_db_manager.test_connection():
+        if not test_connection():
             raise Exception("Database connection test failed")
-        
-        # Create database if it doesn't exist
-        logger.info("🗄️  Ensuring database exists...")
-        supabase_db_manager.create_database_if_not_exists()
-        
+
         # Setup pgvector extension
         logger.info("🧩 Setting up pgvector extension...")
-        supabase_db_manager.setup_pgvector()
-        
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+                logger.info("pgvector extension enabled")
+        except Exception as e:
+            logger.warning(f"Could not setup pgvector: {e}")
+
         # Create tables if they don't exist
         logger.info("📋 Creating database tables...")
-        supabase_db_manager.create_tables()
-        
+        try:
+            from database import Base
+            Base.metadata.create_all(bind=engine)
+            logger.info("Database tables created successfully")
+        except Exception as e:
+            logger.warning(f"Could not create tables: {e}")
+
         # Get database information
         logger.info("📊 Getting database information...")
         try:
-            conn_info = supabase_db_manager.get_connection_info()
-            stats = supabase_db_manager.get_stats()
-            
-            logger.info(f"✅ Supabase database initialized successfully!")
-            logger.info(f"   - {conn_info.get('postgresql_version', 'Unknown PostgreSQL version')}")
-            logger.info(f"   - Database: {conn_info.get('database_name', 'unknown')}")
-            logger.info(f"   - User: {conn_info.get('user', 'unknown')}")
-            logger.info(f"   - pgvector: {conn_info.get('pgvector', 'unknown')}")
-            logger.info(f"   - Connection: {conn_info.get('connection_url_masked', 'unknown')}")
-            
-            if stats and not stats.get('error'):
-                logger.info(f"   - Codebases: {stats.get('codebases_count', 0)}")
-                logger.info(f"   - Code chunks: {stats.get('chunks_count', 0)}")
-                logger.info(f"   - Database size: {stats.get('database_size', 'Unknown')}")
-            else:
-                logger.info("   - Statistics: unavailable")
-                    
+            with engine.connect() as conn:
+                version = conn.execute(text("SELECT version()")).scalar()
+                db_name = conn.execute(text("SELECT current_database()")).scalar()
+                user = conn.execute(text("SELECT current_user")).scalar()
+
+                logger.info(f"✅ Database initialized successfully!")
+                logger.info(f"   - PostgreSQL version: {version.split(',')[0] if version else 'unknown'}")
+                logger.info(f"   - Database: {db_name}")
+                logger.info(f"   - User: {user}")
+                logger.info(f"   - Connection: {os.getenv('DATABASE_URL', 'Not set')[:50]}...")
+
         except Exception as e:
             logger.warning(f"Could not get database info: {e}")
             logger.info("✅ Database connection established (info unavailable)")
-            
+
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
-        logger.error("💡 Please check your PostgreSQL configuration:")
-        logger.error(f"   - Host: {os.getenv('POSTGRES_HOST', 'localhost')}")
-        logger.error(f"   - Port: {os.getenv('POSTGRES_PORT', '5432')}")
-        logger.error(f"   - Database: {os.getenv('POSTGRES_DB', 'codebase_db')}")
-        logger.error(f"   - User: {os.getenv('POSTGRES_USER', 'postgres')}")
+        logger.error("💡 Please check your DATABASE_URL configuration:")
+        logger.error(f"   - DATABASE_URL: {os.getenv('DATABASE_URL', 'Not set')[:50]}...")
         logger.error("   - Make sure PostgreSQL server is running")
-        logger.error("   - Make sure pgvector extension is available")
         logger.error("   - Check your .env file configuration")
         raise
 
@@ -194,39 +189,41 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, summary="Health Check")
 async def health_check():
-    """Enhanced health check endpoint with PostgreSQL database status."""
+    """Health check endpoint with PostgreSQL database status."""
     try:
-        # Test Supabase database connection
-        from codebase.supabase_database import supabase_db_manager
-        
-        db_healthy = supabase_db_manager.test_connection()
-        
-        # Check if we can import key modules
-        from codebase import CodebaseIndexer
-        from routers.codebase_router import indexer
-        
-        # Determine overall status
-        if db_healthy:
-            status = "healthy"
-            message = "All systems operational - Supabase connected"
-        else:
-            status = "degraded"
-            message = "Supabase database connection failed"
-        
-        # Get additional database info if connection is healthy
+        from database import test_connection, engine
+        from sqlalchemy import text
+
+        # Test database connection
+        db_healthy = test_connection()
+
+        # Get database info if connection is healthy
         db_info = {}
         if db_healthy:
             try:
-                conn_info = supabase_db_manager.get_connection_info()
-                db_info = {
-                    "postgresql_version": conn_info.get('postgresql_version', 'unknown'),
-                    "database_name": conn_info.get('database_name', 'unknown'),
-                    "user": conn_info.get('user', 'unknown'),
-                    "pgvector": conn_info.get('pgvector', 'unknown')
-                }
+                with engine.connect() as conn:
+                    version = conn.execute(text("SELECT version()")).scalar()
+                    db_name = conn.execute(text("SELECT current_database()")).scalar()
+                    user = conn.execute(text("SELECT current_user")).scalar()
+
+                    # Check pgvector extension
+                    pgvector_version = conn.execute(
+                        text("SELECT extversion FROM pg_extension WHERE extname='vector'")
+                    ).scalar()
+
+                    db_info = {
+                        "postgresql_version": version.split(',')[0] if version else 'unknown',
+                        "database": db_name,
+                        "user": user,
+                        "pgvector": f"v{pgvector_version}" if pgvector_version else "not installed"
+                    }
             except Exception as e:
                 db_info = {"info_error": str(e)}
-        
+
+        # Determine overall status
+        status = "healthy" if db_healthy else "degraded"
+        message = "All systems operational" if db_healthy else "Database connection failed"
+
         return HealthResponse(
             status=status,
             message=message,
@@ -240,11 +237,11 @@ async def health_check():
                 "components": {
                     "codebase_indexer": "available",
                     "embeddings": "available",
-                    "vector_store": "supabase"
+                    "vector_store": "postgresql"
                 }
             }
         )
-        
+
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return HealthResponse(

@@ -321,7 +321,7 @@ class CodebaseIndexer:
                     'line_start': 1,
                     'line_end': len(chunk_content.split('\n')),
                     'parent_name': None,
-                    'docstring': None
+                    'description': None
                 })()
                 chunks.append(chunk)
         
@@ -329,7 +329,7 @@ class CodebaseIndexer:
         records = []
         for chunk in chunks:
             try:
-                # Generate embedding
+                # Generate code embedding
                 embedding_result = self.embedding_generator.generate_embedding(
                     chunk.content,
                     metadata={
@@ -339,7 +339,22 @@ class CodebaseIndexer:
                         'language': chunk.language
                     }
                 )
-                
+
+                # Generate description embedding if description exists
+                description_embedding = None
+                if chunk.description:
+                    description_embedding_result = self.embedding_generator.generate_embedding(
+                        chunk.description,
+                        for_query=True,  # Description is natural language
+                        metadata={
+                            'chunk_type': 'description',
+                            'name': chunk.name,
+                            'file_path': chunk.file_path
+                        }
+                    )
+                    if description_embedding_result:
+                        description_embedding = description_embedding_result.embedding
+
                 if embedding_result:
                     # Create vector record
                     record = VectorRecord(
@@ -353,7 +368,8 @@ class CodebaseIndexer:
                         line_start=chunk.line_start,
                         line_end=chunk.line_end,
                         parent_name=chunk.parent_name,
-                        docstring=chunk.docstring,
+                        description=chunk.description,
+                        description_embedding=description_embedding,
                         metadata={
                             'file_hash': file_info.hash,
                             'file_size': file_info.size,
@@ -361,7 +377,7 @@ class CodebaseIndexer:
                         }
                     )
                     records.append(record)
-                
+
             except Exception as e:
                 logger.warning(f"Error creating record for chunk in {file_info.path}: {e}")
                 continue
@@ -369,30 +385,34 @@ class CodebaseIndexer:
         return records
     
     def search(
-        self, 
-        query: str, 
-        codebase_name: str, 
+        self,
+        query: str,
+        codebase_name: str,
         top_k: int = None,
         search_type: str = "semantic",
         filters: Dict[str, Any] = None,
-        include_context: bool = True
+        include_context: bool = True,
+        use_hyde: bool = False,
+        use_reranking: bool = False
     ) -> Dict[str, Any]:
         """
         Search the indexed codebase.
-        
+
         Args:
             query: Search query
             codebase_name: Name of codebase to search
             top_k: Number of results to return
-            search_type: Type of search ("semantic", "hybrid", "keyword")
+            search_type: Type of search ("semantic", "hybrid", "keyword", "hyde")
             filters: Optional filters
             include_context: Whether to include formatted context
-            
+            use_hyde: Whether to use HyDE for query enhancement
+            use_reranking: Whether to apply reranking to results
+
         Returns:
             Dictionary with search results
         """
         top_k = top_k or self.config.default_top_k
-        
+
         try:
             # Perform search
             results = self.search_engine.search(
@@ -400,17 +420,39 @@ class CodebaseIndexer:
                 codebase_name=codebase_name,
                 top_k=top_k,
                 filters=filters,
-                search_type=search_type
+                search_type=search_type,
+                use_hyde=use_hyde
             )
-            
+
+            # Apply reranking if requested
+            if use_reranking and results:
+                from .retrieval.reranker import CodeReranker, ConfidenceFilter, DiversityFilter
+
+                # Rerank results
+                reranker = CodeReranker()
+                results = reranker.rerank(results, query, top_k=top_k * 2)
+
+                # Apply confidence filter
+                confidence_filter = ConfidenceFilter(min_score=0.3)
+                results = confidence_filter.filter(results)
+
+                # Apply diversity filter
+                diversity_filter = DiversityFilter(max_per_file=2)
+                results = diversity_filter.filter(results)
+
+                # Limit to top_k after filtering
+                results = results[:top_k]
+
             response = {
                 'query': query,
                 'codebase_name': codebase_name,
                 'results': [asdict(result) for result in results],
                 'total_results': len(results),
-                'search_type': search_type
+                'search_type': search_type,
+                'use_hyde': use_hyde,
+                'use_reranking': use_reranking
             }
-            
+
             # Add formatted context if requested
             if include_context and results:
                 response['context'] = self.context_manager.build_context_from_results(
@@ -419,9 +461,9 @@ class CodebaseIndexer:
                 response['summary'] = self.context_manager.format_search_summary(
                     query, results
                 )
-            
+
             return response
-            
+
         except Exception as e:
             logger.error(f"Error in search: {e}")
             return {

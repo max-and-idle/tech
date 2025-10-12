@@ -10,8 +10,10 @@ from enum import Enum
 class SearchType(str, Enum):
     """Types of search available."""
     semantic = "semantic"
-    hybrid = "hybrid" 
+    hybrid = "hybrid"
     keyword = "keyword"
+    hyde = "hyde"  # HyDE-enhanced semantic search
+    description = "description"  # Description-only similarity search
 
 
 class SourceType(str, Enum):
@@ -55,6 +57,8 @@ class SearchRequest(BaseModel):
     search_type: SearchType = Field(SearchType.semantic, description="Type of search")
     filters: Optional[Dict[str, str]] = Field(None, description="Optional filters")
     include_context: bool = Field(True, description="Whether to include formatted context")
+    use_hyde: bool = Field(False, description="Use HyDE for query enhancement (natural language → code)")
+    use_reranking: bool = Field(False, description="Apply reranking with code-specific heuristics")
 
 
 # Response Models
@@ -79,7 +83,7 @@ class SearchResultItem(BaseModel):
     line_start: int
     line_end: int
     parent_name: Optional[str] = None
-    docstring: Optional[str] = None
+    description: Optional[str] = None
     score: float
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -114,6 +118,8 @@ class SearchResponse(BaseModel):
     search_type: str
     context: Optional[str] = None
     summary: Optional[str] = None
+    use_hyde: bool = False
+    use_reranking: bool = False
     error: Optional[str] = None
 
 
