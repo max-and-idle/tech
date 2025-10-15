@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 
 from routers import codebase_router
+from routers import code_plan_router
 from models.codebase_models import HealthResponse, ErrorResponse
 
 # Setup logging
@@ -164,9 +165,14 @@ async def log_requests(request: Request, call_next):
 
 # Include routers
 app.include_router(
-    codebase_router.router, 
-    prefix="/api/codebase", 
+    codebase_router.router,
+    prefix="/api/codebase",
     tags=["codebase"]
+)
+app.include_router(
+    code_plan_router.router,
+    prefix="/api/code-plan",
+    tags=["code-plan"]
 )
 
 
@@ -177,12 +183,13 @@ async def root():
     return {
         "name": "Tech API",
         "version": "1.0.0",
-        "description": "API for codebase indexing and semantic search",
+        "description": "API for codebase indexing and semantic search with AI-powered code modification planning",
         "docs": "/docs",
         "redoc": "/redoc",
         "health": "/health",
         "endpoints": {
-            "codebase": "/api/codebase"
+            "codebase": "/api/codebase",
+            "code_plan": "/api/code-plan"
         }
     }
 

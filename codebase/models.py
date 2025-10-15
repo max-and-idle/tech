@@ -89,11 +89,72 @@ class CodeChunk(Base):
         }
 
 
+class CodeRelationship(Base):
+    """Code relationship model for storing relationships between code chunks."""
+
+    __tablename__ = "code_relationships"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    codebase_id = Column(Integer, ForeignKey("codebases.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Source (the code that references/uses/calls)
+    source_chunk_id = Column(UUID(as_uuid=True), ForeignKey("code_chunks.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_name = Column(String(255), index=True)
+    source_type = Column(String(50), index=True)  # 'function', 'class', 'method'
+    source_file = Column(Text, nullable=False)
+
+    # Target (the code being referenced/used/called)
+    target_chunk_id = Column(UUID(as_uuid=True), ForeignKey("code_chunks.id", ondelete="CASCADE"), nullable=True, index=True)
+    target_name = Column(String(255), index=True)
+    target_type = Column(String(50), index=True)  # 'function', 'class', 'method', 'module', 'attribute'
+    target_file = Column(Text, nullable=True)
+
+    # Relationship metadata
+    relationship_type = Column(String(50), nullable=False, index=True)  # 'calls', 'imports', 'inherits', 'uses'
+    line_number = Column(Integer)  # Line where relationship occurs
+    context = Column(Text)  # Code snippet showing the relationship
+    meta_info = Column(JSON)  # Additional metadata
+
+    # Timestamp
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    codebase = relationship("Codebase")
+    source_chunk = relationship("CodeChunk", foreign_keys=[source_chunk_id])
+    target_chunk = relationship("CodeChunk", foreign_keys=[target_chunk_id])
+
+    def __repr__(self):
+        return f"<CodeRelationship(source='{self.source_name}', target='{self.target_name}', type='{self.relationship_type}')>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for API responses."""
+        return {
+            'id': self.id,
+            'source': {
+                'chunk_id': str(self.source_chunk_id),
+                'name': self.source_name,
+                'type': self.source_type,
+                'file': self.source_file
+            },
+            'target': {
+                'chunk_id': str(self.target_chunk_id) if self.target_chunk_id else None,
+                'name': self.target_name,
+                'type': self.target_type,
+                'file': self.target_file
+            },
+            'relationship_type': self.relationship_type,
+            'line_number': self.line_number,
+            'context': self.context,
+            'metadata': self.meta_info or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
 class IndexingHistory(Base):
     """Track indexing operations for debugging and monitoring."""
-    
+
     __tablename__ = "indexing_history"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     codebase_id = Column(Integer, ForeignKey("codebases.id", ondelete="CASCADE"))
     operation = Column(String(50))  # 'create', 'update', 'delete'
@@ -102,9 +163,9 @@ class IndexingHistory(Base):
     error_message = Column(Text)
     started_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
-    
+
     # Relationships
     codebase = relationship("Codebase")
-    
+
     def __repr__(self):
         return f"<IndexingHistory(operation='{self.operation}', status='{self.status}')>"

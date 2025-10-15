@@ -95,9 +95,9 @@ class ContextManager:
                     context_parts.append(" | ".join(header_parts))
                     context_parts.append("")
                 
-                # Add docstring if available
-                if result.docstring:
-                    context_parts.append(f"*Docstring: {result.docstring}*")
+                # Add description if available
+                if result.description:
+                    context_parts.append(f"*Description: {result.description}*")
                     context_parts.append("")
                 
                 # Add code content

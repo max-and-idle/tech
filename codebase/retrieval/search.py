@@ -17,6 +17,14 @@ except ImportError:
     HYDE_AVAILABLE = False
     logger.warning("HyDE module not available")
 
+# Import Translation Agent
+try:
+    from translation_agent import translation_agent
+    TRANSLATION_AVAILABLE = True
+except ImportError:
+    TRANSLATION_AVAILABLE = False
+    logger.warning("Translation agent not available")
+
 
 @dataclass
 class SearchResult:
@@ -58,6 +66,16 @@ class SemanticSearch:
             except Exception as e:
                 logger.warning(f"Failed to initialize HyDE generator: {e}")
                 self.hyde_generator = None
+
+        # Initialize Translation Agent if available
+        self.translation_agent = None
+        if TRANSLATION_AVAILABLE:
+            try:
+                self.translation_agent = translation_agent
+                logger.info("Translation agent initialized for semantic search")
+            except Exception as e:
+                logger.warning(f"Failed to initialize translation agent: {e}")
+                self.translation_agent = None
     
     def search(
         self,
@@ -83,25 +101,41 @@ class SemanticSearch:
             List of SearchResult objects
         """
         try:
-            # Auto-enable HyDE if search_type is "hyde"
+            # Route search types
             if search_type == "hyde":
-                use_hyde = True
-                search_type = "semantic"
+                # Quick HyDE (1-stage, fast) - default
+                if self.hyde_generator and self.hyde_generator.is_enabled():
+                    return self._hyde_quick_search(query, codebase_name, top_k, filters)
+                else:
+                    logger.warning("HyDE not available, falling back to semantic")
+                    return self._semantic_search(query, codebase_name, top_k, filters)
 
-            if search_type == "semantic":
-                if use_hyde and self.hyde_generator and self.hyde_generator.is_enabled():
+            elif search_type == "hyde_full":
+                # Full HyDE (2-stage, accurate)
+                if self.hyde_generator and self.hyde_generator.is_enabled():
                     return self._hyde_search(query, codebase_name, top_k, filters)
                 else:
+                    logger.warning("HyDE not available, falling back to semantic")
                     return self._semantic_search(query, codebase_name, top_k, filters)
+
+            elif search_type == "semantic":
+                if use_hyde and self.hyde_generator and self.hyde_generator.is_enabled():
+                    return self._hyde_quick_search(query, codebase_name, top_k, filters)
+                else:
+                    return self._semantic_search(query, codebase_name, top_k, filters)
+
             elif search_type == "hybrid":
                 if use_hyde and self.hyde_generator and self.hyde_generator.is_enabled():
                     return self._hyde_hybrid_search(query, codebase_name, top_k, filters)
                 else:
                     return self._hybrid_search(query, codebase_name, top_k, filters)
+
             elif search_type == "keyword":
                 return self._keyword_search(query, codebase_name, top_k, filters)
+
             elif search_type == "description":
                 return self._description_search(query, codebase_name, top_k, filters)
+
             else:
                 logger.warning(f"Unknown search type: {search_type}, using semantic")
                 return self._semantic_search(query, codebase_name, top_k, filters)
@@ -470,6 +504,56 @@ class SemanticSearch:
 
         return final_results[:top_k]
 
+    def _hyde_quick_search(
+        self,
+        query: str,
+        codebase_name: str,
+        top_k: int,
+        filters: Dict[str, Any] = None
+    ) -> List[SearchResult]:
+        """
+        Perform quick HyDE search (1-stage only, faster).
+
+        Generates hypothetical code from query and searches directly,
+        without the context-enhanced second stage.
+
+        Args:
+            query: Natural language query
+            codebase_name: Name of codebase to search
+            top_k: Number of final results to return
+            filters: Optional filters
+
+        Returns:
+            List of SearchResult objects
+        """
+        logger.info(f"Performing quick HyDE search for: {query}")
+
+        # Generate quick HyDE query (single stage)
+        hyde_query = self.hyde_generator.generate_quick_hyde(query)
+        if not hyde_query:
+            logger.warning("Quick HyDE generation failed, falling back to regular search")
+            return self._semantic_search(query, codebase_name, top_k, filters)
+
+        logger.info(f"Quick HyDE query generated (length: {len(hyde_query)})")
+
+        # Perform semantic search with HyDE query
+        results = self._semantic_search(
+            hyde_query,
+            codebase_name,
+            top_k,
+            filters,
+            for_query=False  # HyDE query is code, not natural language
+        )
+
+        # Add metadata about HyDE
+        for result in results:
+            result.metadata.update({
+                'search_method': 'hyde_quick',
+                'hyde_query_length': len(hyde_query)
+            })
+
+        return results
+
     def _hyde_hybrid_search(
         self,
         query: str,
@@ -588,9 +672,10 @@ class SemanticSearch:
     ) -> List[SearchResult]:
         """
         Search using description embeddings (natural language).
+        Automatically translates Korean queries to English using translation agent.
 
         Args:
-            query: Natural language query
+            query: Natural language query (Korean or English)
             codebase_name: Name of codebase
             top_k: Number of results
             filters: Optional filters
@@ -598,8 +683,28 @@ class SemanticSearch:
         Returns:
             List of SearchResult objects
         """
-        # Generate query embedding (natural language)
-        embedding_result = self.embedding_generator.generate_embedding(query, for_query=True)
+        original_query = query
+        translated_query = query
+
+        # Translate query if translation agent is available
+        if self.translation_agent:
+            try:
+                logger.info(f"Translating query with agent: {query}")
+                # Call translation agent
+                result = self.translation_agent.run(f"Translate this search query to English: {query}")
+
+                # Extract translated text from agent response
+                if hasattr(result, 'content') and result.content:
+                    translated_query = result.content.strip()
+                    logger.info(f"Query translated: '{original_query}' → '{translated_query}'")
+                else:
+                    logger.warning("Translation agent returned empty response")
+
+            except Exception as e:
+                logger.warning(f"Translation agent failed: {e}, using original query")
+
+        # Generate query embedding (natural language) with translated query
+        embedding_result = self.embedding_generator.generate_embedding(translated_query, for_query=True)
         if not embedding_result:
             logger.error("Failed to generate query embedding for description search")
             return []
@@ -627,7 +732,11 @@ class SemanticSearch:
                 parent_name=result['parent_name'],
                 description=result['description'],
                 score=1.0 - result['score'],  # Convert distance to similarity
-                metadata={'search_method': 'description'}
+                metadata={
+                    'search_method': 'description',
+                    'original_query': original_query,
+                    'translated_query': translated_query if original_query != translated_query else None
+                }
             )
             search_results.append(search_result)
 

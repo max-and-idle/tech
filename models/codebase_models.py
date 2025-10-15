@@ -12,7 +12,8 @@ class SearchType(str, Enum):
     semantic = "semantic"
     hybrid = "hybrid"
     keyword = "keyword"
-    hyde = "hyde"  # HyDE-enhanced semantic search
+    hyde = "hyde"  # Quick HyDE (1-stage, fast)
+    hyde_full = "hyde_full"  # Full HyDE (2-stage, accurate)
     description = "description"  # Description-only similarity search
 
 

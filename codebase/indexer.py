@@ -11,7 +11,10 @@ from dataclasses import asdict
 from tqdm import tqdm
 
 from .config import CodebaseConfig, default_config
-from .core import CodeParser, FilePreprocessor, EmbeddingGenerator, VectorStore, VectorRecord
+from .core import (
+    CodeParser, FilePreprocessor, EmbeddingGenerator, VectorStore, VectorRecord,
+    CodeRelationshipExtractor, RelationshipStore
+)
 from .sources import GitHubSource, ZipSource, LocalSource
 from .retrieval import SemanticSearch, ContextManager
 
@@ -20,32 +23,36 @@ logger = logging.getLogger(__name__)
 
 class CodebaseIndexer:
     """Main class for indexing and searching codebases."""
-    
+
     def __init__(self, config: CodebaseConfig = None):
         """
         Initialize the codebase indexer.
-        
+
         Args:
             config: Configuration object
         """
         self.config = config or default_config
-        
+
         # Initialize core components
         self.parser = CodeParser()
         self.preprocessor = FilePreprocessor(self.config)
         self.embedding_generator = EmbeddingGenerator(self.config.embedding_model)
         self.vector_store = VectorStore(self.config.database_url)
-        
+
+        # Initialize relationship components
+        self.relationship_extractor = CodeRelationshipExtractor()
+        self.relationship_store = RelationshipStore()
+
         # Initialize retrieval components
         self.search_engine = SemanticSearch(self.vector_store, self.embedding_generator)
         self.context_manager = ContextManager(self.config.max_context_tokens)
-        
+
         # Initialize source handlers
         self.github_source = GitHubSource()
         self.zip_source = ZipSource()
         self.local_source = LocalSource()
-        
-        logger.info("CodebaseIndexer initialized")
+
+        logger.info("CodebaseIndexer initialized with relationship extraction")
     
     def index_github_repository(self, url: str, name: str = None) -> Dict[str, Any]:
         """
@@ -232,39 +239,61 @@ class CodebaseIndexer:
             logger.info(f"Creating vector store table for: {codebase_name}")
             self.vector_store.create_codebase_table(codebase_name)
             
-            # Process files and generate embeddings
+            # Get codebase ID for relationships
+            from database import SessionLocal
+            from codebase.models import Codebase
+            db = SessionLocal()
+            try:
+                codebase = db.query(Codebase).filter(Codebase.name == codebase_name).first()
+                codebase_id = codebase.id if codebase else None
+            finally:
+                db.close()
+
+            # Process files and generate embeddings + relationships
             all_records = []
+            all_relationships = []
             total_chunks = 0
             processed_files = 0
-            
+
             for file_info in tqdm(files, desc="Processing files"):
                 try:
-                    records = self._process_file(file_info, codebase_name)
+                    records, relationships = self._process_file(file_info, codebase_name, codebase_id)
                     all_records.extend(records)
+                    all_relationships.extend(relationships)
                     total_chunks += len(records)
                     processed_files += 1
                 except Exception as e:
                     logger.warning(f"Error processing {file_info.path}: {e}")
                     continue
-            
+
             # Insert records into vector store
             if all_records:
                 logger.info(f"Inserting {len(all_records)} records into vector store...")
                 success = self.vector_store.insert_records(codebase_name, all_records)
-                
+
                 if not success:
                     return {
                         'status': 'error',
                         'error': 'Failed to insert records into vector store',
                         'name': codebase_name
                     }
+
+            # Insert relationships
+            if all_relationships:
+                logger.info(f"Inserting {len(all_relationships)} relationships...")
+                self.relationship_store.insert_relationships(codebase_name, all_relationships)
             
+            # Get relationship statistics
+            relationship_stats = self.relationship_store.get_relationship_stats(codebase_name)
+
             # Generate final statistics
             stats = {
                 'total_files': len(files),
                 'processed_files': processed_files,
                 'total_chunks': total_chunks,
                 'successful_embeddings': len(all_records),
+                'total_relationships': len(all_relationships),
+                'relationship_stats': relationship_stats,
                 'file_types': self.preprocessor.get_file_stats(files),
                 'source_type': source_type,
                 'source_url': source_url,
@@ -289,25 +318,26 @@ class CodebaseIndexer:
                 'name': codebase_name
             }
     
-    def _process_file(self, file_info, codebase_name: str) -> List[VectorRecord]:
+    def _process_file(self, file_info, codebase_name: str, codebase_id: int) -> tuple:
         """
-        Process a single file and generate vector records.
-        
+        Process a single file and generate vector records and relationships.
+
         Args:
             file_info: FileInfo object
             codebase_name: Name of the codebase
-            
+            codebase_id: Codebase ID for relationships
+
         Returns:
-            List of VectorRecord objects
+            Tuple of (vector_records, relationships)
         """
         # Read file content
         content, encoding = self.preprocessor.read_file_content(file_info.path)
         if not content.strip():
-            return []
-        
+            return [], []
+
         # Parse file into code chunks
         chunks = self.parser.parse_file(file_info.path, content, file_info.language)
-        
+
         if not chunks:
             # If no structured chunks found, create text chunks
             text_chunks = self.preprocessor.chunk_content(content)
@@ -324,9 +354,11 @@ class CodebaseIndexer:
                     'description': None
                 })()
                 chunks.append(chunk)
-        
-        # Generate embeddings and create vector records
+
+        # Generate embeddings and create vector records + extract relationships
         records = []
+        all_relationships = []
+
         for chunk in chunks:
             try:
                 # Generate code embedding
@@ -356,9 +388,12 @@ class CodebaseIndexer:
                         description_embedding = description_embedding_result.embedding
 
                 if embedding_result:
+                    # Generate unique chunk ID
+                    chunk_id = str(uuid.uuid4())
+
                     # Create vector record
                     record = VectorRecord(
-                        id=str(uuid.uuid4()),
+                        id=chunk_id,
                         text=chunk.content,
                         vector=embedding_result.embedding,
                         chunk_type=chunk.chunk_type,
@@ -378,11 +413,26 @@ class CodebaseIndexer:
                     )
                     records.append(record)
 
+                    # Extract relationships (only for Python code chunks)
+                    if file_info.language == 'python' and chunk.chunk_type in ['function', 'class', 'method']:
+                        try:
+                            relationships = self.relationship_extractor.extract_relationships(
+                                code=chunk.content,
+                                file_path=chunk.file_path,
+                                chunk_id=chunk_id,
+                                chunk_name=chunk.name,
+                                chunk_type=chunk.chunk_type,
+                                codebase_id=codebase_id
+                            )
+                            all_relationships.extend(relationships)
+                        except Exception as rel_error:
+                            logger.debug(f"Error extracting relationships from {chunk.name}: {rel_error}")
+
             except Exception as e:
                 logger.warning(f"Error creating record for chunk in {file_info.path}: {e}")
                 continue
-        
-        return records
+
+        return records, all_relationships
     
     def search(
         self,
@@ -433,7 +483,7 @@ class CodebaseIndexer:
                 results = reranker.rerank(results, query, top_k=top_k * 2)
 
                 # Apply confidence filter
-                confidence_filter = ConfidenceFilter(min_score=0.3)
+                confidence_filter = ConfidenceFilter(min_score=0.2)
                 results = confidence_filter.filter(results)
 
                 # Apply diversity filter

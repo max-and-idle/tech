@@ -18,7 +18,7 @@ if not DATABASE_URL:
 
 # Ensure we're using the psycopg2 driver
 if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
 
 # Create SQLAlchemy engine
 engine = create_engine(
